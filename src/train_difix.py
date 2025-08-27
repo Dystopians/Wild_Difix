@@ -4,6 +4,7 @@ import lpips
 import random
 import argparse
 import numpy as np
+import math
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -11,7 +12,7 @@ import torchvision
 import transformers
 from torchvision.transforms.functional import crop
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DistributedDataParallelKwargs
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -30,10 +31,16 @@ from loss import gram_loss
 
 
 def main(args):
+    ddp_kwargs = DistributedDataParallelKwargs(
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+        static_graph=False,
+    )
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
+        kwargs_handlers=[ddp_kwargs],
     )
 
     if accelerator.is_local_main_process:
@@ -54,6 +61,8 @@ def main(args):
         lora_rank_vae=args.lora_rank_vae, 
         timestep=args.timestep,
         mv_unet=args.mv_unet,
+        freeze_unet=args.freeze_unet,
+        train_unet=args.train_unet,
     )
     net_difix.set_train()
 
@@ -69,17 +78,18 @@ def main(args):
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
 
-    net_lpips = lpips.LPIPS(net='vgg').cuda()
+    net_lpips = lpips.LPIPS(net=args.lpips_net)
 
     net_lpips.requires_grad_(False)
     
-    net_vgg = torchvision.models.vgg16(pretrained=True).features
+    net_vgg = torchvision.models.vgg16(pretrained=True).features.float()
     for param in net_vgg.parameters():
         param.requires_grad_(False)
 
     # make the optimizer
     layers_to_opt = []
-    layers_to_opt += list(net_difix.unet.parameters())
+    if not args.freeze_unet and args.train_unet:
+        layers_to_opt += list(net_difix.unet.parameters())
    
     for n, _p in net_difix.vae.named_parameters():
         if "lora" in n and "vae_skip" in n:
@@ -90,16 +100,37 @@ def main(args):
         list(net_difix.vae.decoder.skip_conv_3.parameters()) + \
         list(net_difix.vae.decoder.skip_conv_4.parameters())
 
-    optimizer = torch.optim.AdamW(layers_to_opt, lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,)
-    lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps * accelerator.num_processes,
-        num_cycles=args.lr_num_cycles, power=args.lr_power,)
-
+    # Deduplicate parameters to avoid duplicate params across groups
+    _seen, _unique = set(), []
+    for p in layers_to_opt:
+        _id = id(p)
+        if _id not in _seen:
+            _unique.append(p)
+            _seen.add(_id)
+    if args.use_8bit_optimizer:
+        try:
+            import bitsandbytes as bnb
+            optimizer = bnb.optim.AdamW8bit(_unique, lr=args.learning_rate,
+                betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
+                eps=args.adam_epsilon)
+        except Exception as e:
+            print(f"bitsandbytes not available ({e}), falling back to torch AdamW")
+            optimizer = torch.optim.AdamW(_unique, lr=args.learning_rate,
+                betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
+                eps=args.adam_epsilon,)
+    else:
+        optimizer = torch.optim.AdamW(_unique, lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,)
     dataset_train = PairedDataset(dataset_path=args.dataset_path, split="train", tokenizer=net_difix.tokenizer)
     dl_train = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
+    # Build LR scheduler after computing total target steps (now dl_train is defined)
+    steps_per_epoch = math.ceil(len(dl_train) / max(1, args.gradient_accumulation_steps)) if len(dl_train) > 0 else 1
+    target_max_steps = args.max_train_steps if args.max_train_steps and args.max_train_steps > 0 else steps_per_epoch * max(1, args.num_training_epochs)
+    lr_scheduler = get_scheduler(args.lr_scheduler, optimizer=optimizer,
+        num_warmup_steps=min(args.lr_warmup_steps, target_max_steps),
+        num_training_steps=target_max_steps,
+        num_cycles=args.lr_num_cycles, power=args.lr_power,)
     dataset_val = PairedDataset(dataset_path=args.dataset_path, split="test", tokenizer=net_difix.tokenizer)
     random.Random(42).shuffle(dataset_val.img_names)
     dl_val = torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=0)
@@ -134,16 +165,17 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Move al networksr to device and cast to weight_dtype
-    net_difix.to(accelerator.device, dtype=weight_dtype)
-    net_lpips.to(accelerator.device, dtype=weight_dtype)
-    net_vgg.to(accelerator.device, dtype=weight_dtype)
-    
-    # Prepare everything with our `accelerator`.
-    net_difix, optimizer, dl_train, lr_scheduler = accelerator.prepare(
-        net_difix, optimizer, dl_train, lr_scheduler
+    # Quick signature check before DDP: all ranks must match
+    def _param_signature(m):
+        return tuple([tuple(p.shape) for p in m.parameters() if p.requires_grad])
+    sig = _param_signature(net_difix)
+    print(f"[rank={accelerator.process_index}] trainable_params={len(sig)} first3={sig[:3]}", flush=True)
+    accelerator.wait_for_everyone()
+
+    # One-shot prepare: place models/optimizer/dataloaders/devices via Accelerator
+    net_difix, net_lpips, net_vgg, optimizer, dl_train, lr_scheduler = accelerator.prepare(
+        net_difix, net_lpips, net_vgg, optimizer, dl_train, lr_scheduler
     )
-    net_lpips, net_vgg = accelerator.prepare(net_lpips, net_vgg)
     # renorm with image net statistics
     t_vgg_renorm =  transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
@@ -159,10 +191,11 @@ def main(args):
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
 
-    progress_bar = tqdm(range(0, args.max_train_steps), initial=global_step, desc="Steps",
+    progress_bar = tqdm(range(0, target_max_steps), initial=global_step, desc="Steps",
         disable=not accelerator.is_local_main_process,)
 
     # start the training loop
+    should_break = False
     for epoch in range(0, args.num_training_epochs):
         for step, batch in enumerate(dl_train):
             l_acc = [net_difix]
@@ -171,42 +204,68 @@ def main(args):
                 x_tgt = batch["output_pixel_values"]
                 B, V, C, H, W = x_src.shape
 
-                # forward pass
-                x_tgt_pred = net_difix(x_src, prompt_tokens=batch["input_ids"])       
-                
-                x_tgt = rearrange(x_tgt, 'b v c h w -> (b v) c h w')
-                x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
-                         
-                # Reconstruction loss
-                loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
-                loss_lpips = net_lpips(x_tgt_pred.float(), x_tgt.float()).mean() * args.lambda_lpips
-                loss = loss_l2 + loss_lpips
-                
-                # Gram matrix loss
-                if args.lambda_gram > 0:
-                    if global_step > args.gram_loss_warmup_steps:
-                        x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
-                        crop_h, crop_w = 400, 400
-                        top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
-                        x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
-                        
-                        x_tgt_renorm = t_vgg_renorm(x_tgt * 0.5 + 0.5)
-                        x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w)
-                        
-                        loss_gram = gram_loss(x_tgt_pred_renorm.to(weight_dtype), x_tgt_renorm.to(weight_dtype), net_vgg) * args.lambda_gram
-                        loss += loss_gram
-                    else:
-                        loss_gram = torch.tensor(0.0).to(weight_dtype)                    
+                # Optionally micro-batch over views to reduce memory
+                total_loss = 0.0
+                l2_total, lpips_total, gram_total = 0.0, 0.0, 0.0
+                V_mb = args.views_per_microbatch
+                num_chunks = (V + V_mb - 1) // V_mb
+                for v0 in range(0, V, V_mb):
+                    x_src_mb = x_src[:, v0:v0+V_mb]
+                    x_tgt_mb = x_tgt[:, v0:v0+V_mb]
 
-                accelerator.backward(loss, retain_graph=False)
+                    x_tgt_pred_mb = net_difix(x_src_mb, prompt_tokens=batch["input_ids"])       
+                    
+                    xt   = rearrange(x_tgt_mb, 'b v c h w -> (b v) c h w')
+                    xt_p = rearrange(x_tgt_pred_mb, 'b v c h w -> (b v) c h w')
+                             
+                    # Reconstruction loss
+                    loss_l2_mb = F.mse_loss(xt_p.float(), xt.float(), reduction="mean") * args.lambda_l2
+
+                    # LPIPS with optional downsample and view cap
+                    x_lpips_pred = xt_p
+                    x_lpips_tgt  = xt
+                    if args.lpips_downsample is not None and args.lpips_downsample > 0 and (H != args.lpips_downsample or W != args.lpips_downsample):
+                        ds = args.lpips_downsample
+                        x_lpips_pred = F.interpolate(x_lpips_pred, size=(ds, ds), mode="bilinear", align_corners=False)
+                        x_lpips_tgt  = F.interpolate(x_lpips_tgt,  size=(ds, ds), mode="bilinear", align_corners=False)
+                    loss_lpips_mb = net_lpips(x_lpips_pred.float(), x_lpips_tgt.float()).mean() * args.lambda_lpips
+
+                    loss_mb = loss_l2_mb + loss_lpips_mb
+                    # Gram matrix loss (compute on full-res crop)
+                    if args.lambda_gram > 0:
+                        if global_step > args.gram_loss_warmup_steps:
+                            # Disable autocast to keep VGG path strictly in float32 and avoid bf16/float bias mismatch
+                            with torch.cuda.amp.autocast(enabled=False):
+                                x_tgt_pred_renorm = t_vgg_renorm(xt_p.float() * 0.5 + 0.5).float()
+                                crop_h, crop_w = args.gram_crop_size, args.gram_crop_size
+                                top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
+                                x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w).float()
+                                x_tgt_renorm = t_vgg_renorm(xt.float() * 0.5 + 0.5).float()
+                                x_tgt_renorm = crop(x_tgt_renorm, top, left, crop_h, crop_w).float()
+                                loss_gram_mb = gram_loss(x_tgt_pred_renorm, x_tgt_renorm, net_vgg.float()) * args.lambda_gram
+                            loss_mb = loss_mb + loss_gram_mb
+                            gram_total += loss_gram_mb.detach().item()
+                        else:
+                            pass
+
+                    accelerator.backward(loss_mb / num_chunks, retain_graph=False)
+
+                    l2_total += loss_l2_mb.detach().item()
+                    lpips_total += loss_lpips_mb.detach().item()
+                    total_loss += loss_mb.item()
+
+                # expose last micro-batch tensors for optional visualization
+                x_tgt_pred = x_tgt_pred_mb
+                x_tgt = x_tgt_mb
+
+                # collected per-microbatch grads above; no second backward here
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(layers_to_opt, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
                 
-                x_tgt = rearrange(x_tgt, '(b v) c h w -> b v c h w', v=V)
-                x_tgt_pred = rearrange(x_tgt_pred, '(b v) c h w -> b v c h w', v=V)
+                # No need to reshape back for logging unless visualizing
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -215,19 +274,19 @@ def main(args):
 
                 if accelerator.is_main_process:
                     logs = {}
-                    # log all the losses
-                    logs["loss_l2"] = loss_l2.detach().item()
-                    logs["loss_lpips"] = loss_lpips.detach().item()
+                    # log averaged micro-batch losses
+                    logs["loss_l2"] = l2_total / max(num_chunks, 1)
+                    logs["loss_lpips"] = lpips_total / max(num_chunks, 1)
                     if args.lambda_gram > 0:
-                        logs["loss_gram"] = loss_gram.detach().item()
+                        logs["loss_gram"] = gram_total / max(num_chunks, 1)
                     progress_bar.set_postfix(**logs)
 
                     # viz some images
                     if global_step % args.viz_freq == 1:
                         log_dict = {
-                            "train/source": [wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                            "train/target": [wandb.Image(rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
-                            "train/model_output": [wandb.Image(rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu(), caption=f"idx={idx}") for idx in range(B)],
+                            "train/source": [wandb.Image((rearrange(x_src, "b v c h w -> b c (v h) w")[idx].float().detach().cpu() * 0.5 + 0.5).clamp(0,1), caption=f"idx={idx}") for idx in range(B)],
+                            "train/target": [wandb.Image((rearrange(x_tgt, "b v c h w -> b c (v h) w")[idx].float().detach().cpu() * 0.5 + 0.5).clamp(0,1), caption=f"idx={idx}") for idx in range(B)],
+                            "train/model_output": [wandb.Image((rearrange(x_tgt_pred, "b v c h w -> b c (v h) w")[idx].float().detach().cpu() * 0.5 + 0.5).clamp(0,1), caption=f"idx={idx}") for idx in range(B)],
                         }
                         for k in log_dict:
                             logs[k] = log_dict[k]
@@ -251,7 +310,9 @@ def main(args):
                             assert B == 1, "Use batch size 1 for eval."
                             with torch.no_grad():
                                 # forward pass
-                                x_tgt_pred = accelerator.unwrap_model(net_difix)(x_src, prompt_tokens=batch_val["input_ids"].cuda())
+                                x_tgt_pred = accelerator.unwrap_model(net_difix)(
+                                    x_src, prompt_tokens=batch_val["input_ids"].to(accelerator.device)
+                                )
                                 
                                 if step % 10 == 0:
                                     log_dict["sample/source"].append(wandb.Image(rearrange(x_src, "b v c h w -> b c (v h) w")[0].float().detach().cpu(), caption=f"idx={len(log_dict['sample/source'])}"))
@@ -274,6 +335,11 @@ def main(args):
                         gc.collect()
                         torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)
+                if global_step >= target_max_steps:
+                    should_break = True
+                    break
+        if should_break:
+            break
 
 
 if __name__ == "__main__":
@@ -353,6 +419,13 @@ if __name__ == "__main__":
     parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"],)
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers.")
     parser.add_argument("--set_grads_to_none", action="store_true",)
+    parser.add_argument("--use_8bit_optimizer", action="store_true")
+    parser.add_argument("--views_per_microbatch", type=int, default=1)
+    parser.add_argument("--train_unet", action="store_true")
+    parser.add_argument("--freeze_unet", action="store_true")
+    parser.add_argument("--gram_crop_size", default=256, type=int)
+    parser.add_argument("--lpips_net", type=str, default="vgg", choices=["vgg", "alex", "squeeze"], help="LPIPS backbone")
+    parser.add_argument("--lpips_downsample", type=int, default=256, help="Resize H=W to this size before LPIPS (<=0 to disable)")
     
     # resume
     parser.add_argument("--resume", default=None, type=str)

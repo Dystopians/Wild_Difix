@@ -15,10 +15,8 @@ from einops import rearrange, repeat
 
 
 def make_1step_sched():
-    noise_scheduler_1step = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
-    noise_scheduler_1step.set_timesteps(1, device="cuda")
-    noise_scheduler_1step.alphas_cumprod = noise_scheduler_1step.alphas_cumprod.cuda()
-    return noise_scheduler_1step
+    sched = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
+    return sched
 
 
 def my_vae_encoder_fwd(self, sample):
@@ -114,20 +112,25 @@ def save_ckpt(net_difix, optimizer, outf):
 
 
 class Difix(torch.nn.Module):
-    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999):
+    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999, freeze_unet=False, train_unet=None):
         super().__init__()
+        # Control UNet training: train_unet takes precedence if provided
+        if train_unet is not None:
+            self.freeze_unet = not train_unet
+        else:
+            self.freeze_unet = freeze_unet
         self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
-        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
+        self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder")
         self.sched = make_1step_sched()
 
         vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
         vae.decoder.forward = my_vae_decoder_fwd.__get__(vae.decoder, vae.decoder.__class__)
         # add the skip connection convs
-        vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
-        vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False).cuda()
+        vae.decoder.skip_conv_1 = torch.nn.Conv2d(512, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        vae.decoder.skip_conv_2 = torch.nn.Conv2d(256, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        vae.decoder.skip_conv_3 = torch.nn.Conv2d(128, 512, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        vae.decoder.skip_conv_4 = torch.nn.Conv2d(128, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
         vae.decoder.ignore_skip = False
         
         if mv_unet:
@@ -163,11 +166,12 @@ class Difix(torch.nn.Module):
                 "to_k", "to_q", "to_v", "to_out.0",
             ]
             
-            target_modules = []
-            for id, (name, param) in enumerate(vae.named_modules()):
-                if 'decoder' in name and any(name.endswith(x) for x in target_modules_vae):
-                    target_modules.append(name)
-            target_modules_vae = target_modules
+            # Ensure deterministic, rank-consistent ordering of target modules
+            target_modules = [
+                name for name, _ in vae.named_modules()
+                if 'decoder' in name and any(name.endswith(x) for x in target_modules_vae)
+            ]
+            target_modules_vae = sorted(set(target_modules))
             vae.encoder.requires_grad_(False)
 
             vae_lora_config = LoraConfig(r=lora_rank_vae, init_lora_weights="gaussian",
@@ -178,12 +182,11 @@ class Difix(torch.nn.Module):
             self.target_modules_vae = target_modules_vae
 
         # unet.enable_xformers_memory_efficient_attention()
-        unet.to("cuda")
-        vae.to("cuda")
 
         self.unet, self.vae = unet, vae
         self.vae.decoder.gamma = 1
-        self.timesteps = torch.tensor([timestep], device="cuda").long()
+        # Register as a buffer so device placement is handled by Accelerator/DDP
+        self.register_buffer("timesteps", torch.tensor([timestep], dtype=torch.long), persistent=False)
         self.text_encoder.requires_grad_(False)
 
         # print number of trainable parameters
@@ -201,7 +204,7 @@ class Difix(torch.nn.Module):
     def set_train(self):
         self.unet.train()
         self.vae.train()
-        self.unet.requires_grad_(True)
+        self.unet.requires_grad_(not self.freeze_unet)
 
         for n, _p in self.vae.named_parameters():
             if "lora" in n:
@@ -219,10 +222,10 @@ class Difix(torch.nn.Module):
         if prompt is not None:
             # encode the text prompt
             caption_tokens = self.tokenizer(prompt, max_length=self.tokenizer.model_max_length,
-                                            padding="max_length", truncation=True, return_tensors="pt").input_ids.cuda()
+                                            padding="max_length", truncation=True, return_tensors="pt").input_ids.to(x.device)
             caption_enc = self.text_encoder(caption_tokens)[0]
         else:
-            caption_enc = self.text_encoder(prompt_tokens)[0]
+            caption_enc = self.text_encoder(prompt_tokens.to(x.device))[0]
                                 
         num_views = x.shape[1]
         x = rearrange(x, 'b v c h w -> (b v) c h w')
@@ -231,6 +234,11 @@ class Difix(torch.nn.Module):
         
         unet_input = z
         
+        # Ensure scheduler internals and timesteps are on the correct device
+        if getattr(self.sched, "timesteps", None) is None or self.sched.timesteps.device != z.device:
+            self.sched.set_timesteps(1, device=z.device)
+            if hasattr(self.sched, "alphas_cumprod"):
+                self.sched.alphas_cumprod = self.sched.alphas_cumprod.to(z.device)
         model_pred = self.unet(unet_input, self.timesteps, encoder_hidden_states=caption_enc,).sample
         z_denoised = self.sched.step(model_pred, self.timesteps, z, return_dict=True).prev_sample
         self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
@@ -251,10 +259,13 @@ class Difix(torch.nn.Module):
             transforms.Normalize([0.5], [0.5]),
         ])
         if ref_image is None:
-            x = T(image).unsqueeze(0).unsqueeze(0).cuda()
+            # follow module device
+            device = self.timesteps.device if hasattr(self, "timesteps") else next(self.parameters()).device
+            x = T(image).unsqueeze(0).unsqueeze(0).to(device)
         else:
             ref_image = ref_image.resize((new_width, new_height), Image.LANCZOS)
-            x = torch.stack([T(image), T(ref_image)], dim=0).unsqueeze(0).cuda()
+            device = self.timesteps.device if hasattr(self, "timesteps") else next(self.parameters()).device
+            x = torch.stack([T(image), T(ref_image)], dim=0).unsqueeze(0).to(device)
         
         output_image = self.forward(x, timesteps, prompt, prompt_tokens)[:, 0]
         output_pil = transforms.ToPILImage()(output_image[0].cpu() * 0.5 + 0.5)
