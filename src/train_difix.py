@@ -173,9 +173,12 @@ def main(args):
     accelerator.wait_for_everyone()
 
     # One-shot prepare: place models/optimizer/dataloaders/devices via Accelerator
-    net_difix, net_lpips, net_vgg, optimizer, dl_train, lr_scheduler = accelerator.prepare(
-        net_difix, net_lpips, net_vgg, optimizer, dl_train, lr_scheduler
+    # Keep VGG out of prepare so it stays float32 and is not auto-casted to bf16
+    net_difix, net_lpips, optimizer, dl_train, lr_scheduler = accelerator.prepare(
+        net_difix, net_lpips, optimizer, dl_train, lr_scheduler
     )
+    # Place VGG on the correct device with float32
+    net_vgg = net_vgg.to(accelerator.device, dtype=torch.float32)
     # renorm with image net statistics
     t_vgg_renorm =  transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
@@ -235,7 +238,7 @@ def main(args):
                     if args.lambda_gram > 0:
                         if global_step > args.gram_loss_warmup_steps:
                             # Disable autocast to keep VGG path strictly in float32 and avoid bf16/float bias mismatch
-                            with torch.cuda.amp.autocast(enabled=False):
+                            with torch.amp.autocast('cuda', enabled=False):
                                 x_tgt_pred_renorm = t_vgg_renorm(xt_p.float() * 0.5 + 0.5).float()
                                 crop_h, crop_w = args.gram_crop_size, args.gram_crop_size
                                 top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
@@ -292,7 +295,7 @@ def main(args):
                             logs[k] = log_dict[k]
 
                     # checkpoint the model
-                    if global_step % args.checkpointing_steps == 1:
+                    if global_step == 1 or (args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0):
                         outf = os.path.join(args.output_dir, "checkpoints", f"model_{global_step}.pkl")
                         # accelerator.unwrap_model(net_difix).save_model(outf)
                         save_ckpt(accelerator.unwrap_model(net_difix), optimizer, outf)
